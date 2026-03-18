@@ -1,7 +1,9 @@
 import streamlit as st
 import pandas as pd
+import requests
 from datetime import datetime, date, timedelta, time
 import database as db
+import hikvision as hik
 
 # Initialize Database
 db.init_db()
@@ -153,7 +155,7 @@ TIME_OPTIONS = [""] + [
 # Sidebar Navigation
 st.sidebar.title("Navigation")
 st.sidebar.markdown("---")
-page = st.sidebar.radio("Go to", ["Dashboard", "Add Attendance", "View History", "Monthly Reports", "Manage Employees"])
+page = st.sidebar.radio("Go to", ["Dashboard", "Add Attendance", "View History", "Monthly Reports", "HikVision Reports", "Manage Employees"])
 
 # Google Sheets Sync Section
 st.sidebar.markdown("---")
@@ -713,3 +715,173 @@ elif page == "Monthly Reports":
         )
     else:
         st.warning("No attendance data found for this month.")
+
+elif page == "HikVision Reports":
+    st.title("🔒 HikVision Attendance Reports")
+    st.caption("Fetch attendance data from HikVision HikCentral Connect API")
+
+    # --- Session ID config ---
+    env_session = hik.get_jsessionid()
+    with st.expander("⚙️ API Configuration", expanded=not bool(env_session)):
+        jsessionid = st.text_input(
+            "JSESSIONID",
+            value=env_session,
+            type="password",
+            help="Get this from your HikCentral Connect browser session. It expires periodically.",
+            placeholder="e.g. 79bd1d7b-b64c-4be4-b258-71f2e2b324c0",
+        )
+        st.info("💡 You can also set the `HIKVISION_JSESSIONID` env var to avoid entering it each time.")
+
+    if not jsessionid:
+        st.warning("Please provide a JSESSIONID to fetch reports.")
+        st.stop()
+
+    # --- Filters ---
+    st.subheader("📋 Fetch Report")
+    fcol1, fcol2, fcol3 = st.columns(3)
+    with fcol1:
+        hik_start = st.date_input("Start Date", value=date.today(), key="hik_start")
+    with fcol2:
+        hik_end = st.date_input("End Date", value=date.today(), key="hik_end")
+    with fcol3:
+        hik_name_filter = st.text_input("Filter by Name", value="", placeholder="Leave empty for all")
+
+    pcol1, pcol2 = st.columns(2)
+    with pcol1:
+        hik_page_size = st.selectbox("Records per page", [20, 50, 100, 200], index=1)
+    with pcol2:
+        fetch_all = st.checkbox("Fetch all pages automatically", value=True)
+
+    if st.button("🔍 Fetch Report", type="primary"):
+        if hik_start > hik_end:
+            st.error("Start date must be before or equal to end date.")
+        else:
+            with st.spinner("Fetching data from HikVision..."):
+                try:
+                    if fetch_all:
+                        df = hik.fetch_all_pages(jsessionid, hik_start, hik_end, hik_name_filter, hik_page_size)
+                    else:
+                        raw = hik.fetch_attendance(jsessionid, hik_start, hik_end, 1, hik_page_size, hik_name_filter)
+                        rows = raw.get("data", {}).get("list", [])
+                        if not rows:
+                            rows = raw.get("list", [])
+                        if not rows:
+                            rows = raw.get("data", []) if isinstance(raw.get("data"), list) else []
+                        df = pd.DataFrame(rows) if rows else pd.DataFrame()
+                        # Show pagination info
+                        total = raw.get("data", {}).get("total", len(rows))
+                        st.info(f"Showing page 1 — {len(rows)} of {total} total records")
+
+                    st.session_state["hik_data"] = df
+                    if not df.empty:
+                        st.success(f"✅ Fetched {len(df)} records!")
+                    else:
+                        st.warning("No records found for the selected criteria.")
+                except requests.exceptions.HTTPError as e:
+                    if e.response.status_code == 401:
+                        st.error("❌ Authentication failed. Your JSESSIONID may have expired. Please get a new one.")
+                    else:
+                        st.error(f"❌ API error: {e.response.status_code} — {e.response.text[:200]}")
+                except requests.exceptions.ConnectionError:
+                    st.error("❌ Could not connect to HikVision API. Check your network connection.")
+                except Exception as e:
+                    st.error(f"❌ Error: {str(e)}")
+
+    # --- Display results ---
+    if "hik_data" in st.session_state and not st.session_state["hik_data"].empty:
+        df = st.session_state["hik_data"]
+
+        st.markdown("---")
+        st.subheader("📊 Report Data")
+
+        # Try to identify useful columns and create a cleaner display
+        display_df = df.copy()
+
+        # Common column name mappings from HikVision API
+        col_renames = {
+            "fullName": "Full Name",
+            "personCode": "Person Code",
+            "clockDate": "Clock Date",
+            "clockStamp": "Clock Time",
+            "clockTime": "Clock Time",
+            "deviceName": "Device",
+            "groupName": "Group",
+            "temperature": "Temperature",
+            "maskStatus": "Mask Status",
+        }
+        existing_renames = {k: v for k, v in col_renames.items() if k in display_df.columns}
+        if existing_renames:
+            display_df = display_df.rename(columns=existing_renames)
+
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+        # Download as CSV
+        csv = display_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "📥 Download as CSV",
+            data=csv,
+            file_name=f"hikvision_report_{hik_start}_{hik_end}.csv",
+            mime="text/csv",
+        )
+
+        # --- Employee matching preview ---
+        st.markdown("---")
+        st.subheader("🔗 Employee Matching")
+
+        name_col = None
+        for candidate in ["fullName", "Full Name", "name", "employeeName"]:
+            if candidate in df.columns:
+                name_col = candidate
+                break
+
+        if name_col:
+            unique_names = df[name_col].dropna().unique()
+            match_data = []
+            for hname in unique_names:
+                matched = hik.match_hikvision_to_employee(str(hname))
+                match_data.append({
+                    "HikVision Name": hname,
+                    "Matched Employee": matched or "❌ No match",
+                    "Status": "✅" if matched else "❌",
+                })
+            match_df = pd.DataFrame(match_data)
+            matched_count = sum(1 for m in match_data if m["Status"] == "✅")
+            st.caption(f"Matched {matched_count}/{len(unique_names)} names to local employees")
+            st.dataframe(match_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("Could not identify a name column in the API response for matching.")
+
+        # --- Import to local DB ---
+        st.markdown("---")
+        st.subheader("📥 Import to Local DB")
+        st.caption("Import HikVision clock-in records into the local attendance database.")
+
+        # Let user pick columns if auto-detect doesn't work
+        all_cols = list(df.columns)
+        icol1, icol2, icol3 = st.columns(3)
+        with icol1:
+            import_name_col = st.selectbox(
+                "Name Column",
+                all_cols,
+                index=all_cols.index(name_col) if name_col and name_col in all_cols else 0,
+            )
+        with icol2:
+            date_candidates = [c for c in all_cols if "date" in c.lower() or "stamp" in c.lower() or "clock" in c.lower()]
+            default_date_idx = all_cols.index(date_candidates[0]) if date_candidates else 0
+            import_date_col = st.selectbox("Date Column", all_cols, index=default_date_idx)
+        with icol3:
+            time_candidates = [c for c in all_cols if "time" in c.lower() or "stamp" in c.lower()]
+            time_options = ["(none)"] + all_cols
+            default_time_idx = time_options.index(time_candidates[0]) if time_candidates and time_candidates[0] in time_options else 0
+            import_time_col = st.selectbox("Time Column (optional)", time_options, index=default_time_idx)
+
+        if st.button("📥 Import Records", type="primary"):
+            with st.spinner("Importing..."):
+                time_c = import_time_col if import_time_col != "(none)" else None
+                imported, skipped, unmatched = hik.import_to_local_db(df, import_name_col, import_date_col, time_c)
+                if imported:
+                    st.success(f"✅ Imported {imported} records! (Skipped {skipped})")
+                else:
+                    st.warning(f"No records imported. Skipped {skipped}.")
+                if unmatched:
+                    st.warning(f"⚠️ Unmatched names ({len(unmatched)}): {', '.join(unmatched)}")
